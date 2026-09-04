@@ -8,7 +8,7 @@ const cheerio = require("cheerio");
 
 const USER_AGENT = "SkipBot/0.3 (+local research)";
 const FETCH_MS = 8000;
-const OVERALL_MS = 18000;
+const OVERALL_MS = 25000;
 
 const VERDICT_LABELS = {
   Buy: "Good to buy",
@@ -210,9 +210,25 @@ function productTokens(title) {
     .slice(0, 8);
 }
 
-function mentionsProduct(text, tokens) {
-  if (!text || !tokens.length) return false;
+function mentionsProduct(text, tokens, { asin = null, distinctive = [] } = {}) {
+  if (!text) return false;
   const hay = text.toLowerCase();
+  if (asin && hay.includes(String(asin).toLowerCase())) return true;
+
+  const dist = (distinctive || []).map((t) => String(t).toLowerCase()).filter((t) => t.length >= 4);
+  if (dist.length >= 2) {
+    const distHits = dist.filter((t) => hay.includes(t));
+    // Distinctive slug tokens (e.g. Quencher + Insulated) are enough
+    if (distHits.length >= 2) return true;
+    if (distHits.length >= 1 && tokens.some((t) => t.length >= 5 && hay.includes(t) && !dist.includes(t))) {
+      return true;
+    }
+  } else if (dist.length === 1 && hay.includes(dist[0])) {
+    // One strong distinctive token + any other product token
+    if (tokens.filter((t) => t !== dist[0] && hay.includes(t)).length >= 1) return true;
+  }
+
+  if (!tokens.length) return false;
   const hits = tokens.filter((t) => hay.includes(t));
   const numeric = tokens.filter((t) => /\d/.test(t));
   const long = tokens.filter((t) => t.length >= 6);
@@ -221,9 +237,103 @@ function mentionsProduct(text, tokens) {
     return numeric.every((t) => hay.includes(t)) && hits.length >= Math.min(2, tokens.length);
   }
   if (long.length >= 1) {
+    // Looser: require most long tokens, not necessarily every one when many exist
+    const longHits = long.filter((t) => hay.includes(t));
+    if (longHits.length >= Math.min(2, long.length) && hits.length >= 2) return true;
     return long.every((t) => hay.includes(t)) && hits.length >= 2;
   }
   return hits.length >= Math.min(2, tokens.length);
+}
+
+/** Distinctive tokens from Amazon slug / title — skip generic marketplace words */
+function distinctiveTokens(title, slugTitle) {
+  const generic = new Set([
+    "amazon",
+    "compatible",
+    "steel",
+    "bottle",
+    "water",
+    "cup",
+    "mug",
+    "oz",
+    "pack",
+    "set",
+    "with",
+    "for",
+    "and",
+    "the",
+    "new",
+    "black",
+    "white",
+    "blue",
+    "pink",
+    "green",
+    "large",
+    "small",
+    "size",
+    "product",
+    "official",
+    "brand",
+  ]);
+  // Keep some category words as secondary signal but prefer unique product words
+  const preferKeep = new Set([
+    "quencher",
+    "tumbler",
+    "stanley",
+    "yeti",
+    "owala",
+    "hydroflask",
+    "hydro",
+    "flask",
+    "powercore",
+    "anker",
+    "ankerpower",
+  ]);
+  const raw = `${slugTitle || ""} ${title || ""}`;
+  const tokens = String(raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s+.-]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 4 && (!generic.has(t) || preferKeep.has(t)));
+  // Prefer non-generic first
+  const unique = [];
+  const seen = new Set();
+  for (const t of tokens) {
+    if (seen.has(t)) continue;
+    seen.add(t);
+    unique.push(t);
+  }
+  // If we filtered too hard, fall back to long productTokens
+  if (unique.length < 2) {
+    return productTokens(raw).filter((t) => t.length >= 5).slice(0, 6);
+  }
+  return unique.slice(0, 8);
+}
+
+function deriveCategoryQueries(title, slugTitle) {
+  const blob = `${slugTitle || ""} ${title || ""}`.toLowerCase();
+  const queries = [];
+  const words = blob.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const has = (w) => words.includes(w) || blob.includes(w);
+
+  if (has("quencher") || has("tumbler")) {
+    // Derive brand-ish queries from slug words only — never hardcode Stanley unless present
+    if (has("stanley")) {
+      queries.push("Stanley Quencher review problems");
+      queries.push("Stanley Quencher leak mold reddit");
+    } else {
+      queries.push("Quencher tumbler review leak mold");
+      queries.push("Quencher insulated tumbler complaints");
+    }
+    if (has("insulated") || has("stainless")) {
+      queries.push("insulated tumbler mold dishwasher paint peeling");
+    }
+  }
+  if (has("powercore") || (has("anker") && (has("power") || has("bank") || /\b10000\b/.test(blob)))) {
+    queries.push("Anker PowerCore review problems");
+  }
+  return queries;
 }
 
 function parseDdgHtml(html) {
@@ -718,9 +828,11 @@ function decideVerdict(relevant, gotchas, honesty) {
     };
   }
 
-  const hasSafetyGotcha = gotchas.some((g) =>
-    /recall|safety|fire|scam|hazard|counterfeit|fake-review|phishing/i.test(`${g.title} ${g.detail}`)
-  );
+  const hasSafetyGotcha = gotchas.some((g) => {
+    if (g.type && /^(recall|safety|scam|counterfeit|fake_reviews)$/i.test(g.type)) return true;
+    // Title-based only — avoid matching explanatory text that mentions those words in passing
+    return /^(Safety recall|Safety \/|Scam or phishing|Counterfeit|Fake-review)/i.test(g.title || "");
+  });
   if (hasSafetyGotcha) {
     return {
       verdict: "Skip",
@@ -768,8 +880,18 @@ function decideVerdict(relevant, gotchas, honesty) {
   };
 }
 
-async function researchProduct({ title, url, price, siteName } = {}) {
-  const cleanTitle = String(title || "").trim();
+async function researchProduct({
+  title,
+  searchTitle,
+  url,
+  price,
+  siteName,
+  asin = null,
+  slugTitle = null,
+  amazonBlocked = false,
+} = {}) {
+  const cleanTitle = String(searchTitle || title || "").trim();
+  const displayTitle = String(title || searchTitle || "").trim();
   if (!cleanTitle) {
     return attachVerdictLabels({
       verdict: "Wait",
@@ -797,11 +919,26 @@ async function researchProduct({ title, url, price, siteName } = {}) {
   }
 
   const tokens = productTokens(cleanTitle);
-  const brandBit = (siteName || tokens[0] || cleanTitle.split(/\s+/)[0] || "").trim();
+  const distinctive = distinctiveTokens(cleanTitle, slugTitle);
+  // Avoid using marketplace site name as "brand" for queries
+  const siteLooksMarketplace =
+    siteName &&
+    /amazon|walmart|ebay|target|best\s*buy|etsy|aliexpress|temu/i.test(siteName);
+  const brandBit = (
+    (!siteLooksMarketplace && siteName) ||
+    distinctive[0] ||
+    tokens[0] ||
+    cleanTitle.split(/\s+/)[0] ||
+    ""
+  ).trim();
+
+    const complaintTerms =
+    "leak OR mold OR dishwasher OR \"paint peeling\" OR lead OR BPA OR recall OR \"don't buy\" OR reddit";
   const queries = [
     `"${cleanTitle}" review problems`,
     `"${cleanTitle}" complaint OR "don't buy" OR returned`,
     `"${cleanTitle}" reddit`,
+    `${cleanTitle} ${complaintTerms}`,
     `${cleanTitle} recall OR fire OR overheat OR swelling`,
     `${cleanTitle} site:reddit.com`,
     `${cleanTitle} site:cpsc.gov`,
@@ -810,16 +947,36 @@ async function researchProduct({ title, url, price, siteName } = {}) {
     `"${cleanTitle}" fake reviews`,
     `"${cleanTitle}" "don't buy"`,
     `"${cleanTitle}" counterfeit`,
-    brandBit ? `${brandBit} complaint` : null,
+    brandBit && brandBit.toLowerCase() !== "amazon"
+      ? `${brandBit} complaint`
+      : null,
+    asin ? `${asin} review` : null,
+    asin ? `${asin} complaint` : null,
+    asin ? `${asin} reddit` : null,
+    slugTitle ? `${slugTitle} review problems` : null,
+    slugTitle ? `${slugTitle} leak mold dishwasher` : null,
+    ...deriveCategoryQueries(cleanTitle, slugTitle),
   ].filter(Boolean);
+  // Cap query fan-out but keep the most useful ones
+  const uniqueQueries = [];
+  const seenQ = new Set();
+  for (const q of queries) {
+    const key = q.toLowerCase();
+    if (seenQ.has(key)) continue;
+    seenQ.add(key);
+    uniqueQueries.push(q);
+    if (uniqueQueries.length >= 16) break;
+  }
 
   // Per-request timeouts keep wall-clock ~FETCH_MS; avoid chaining many abort listeners.
   {
+    const queries = uniqueQueries;
     const tasks = [
       ...queries.map((q) => searchDuckDuckGo(q)),
       ...queries.map((q) => searchBing(q)),
       searchReddit(cleanTitle),
       searchReddit(`${cleanTitle} scam OR "fake reviews" OR counterfeit`),
+      asin ? searchReddit(asin) : Promise.resolve([]),
       searchCpsc(cleanTitle, tokens),
     ];
 
@@ -837,20 +994,97 @@ async function researchProduct({ title, url, price, siteName } = {}) {
     }
 
     const deduped = dedupeResults(collected);
+    const matchOpts = { asin, distinctive };
     const relevant = deduped.filter((hit) => {
       if (isSpamUrl(hit.url)) return false;
       const text = `${hit.title} ${hit.snippet}`;
-      return mentionsProduct(text, tokens);
+      // Never treat bare "Amazon" marketplace junk as a product match
+      if (/^amazon(\s|$)/i.test((hit.title || "").trim()) && !(asin && text.toLowerCase().includes(String(asin).toLowerCase()))) {
+        if (!mentionsProduct(text, tokens, matchOpts)) return false;
+      }
+      return mentionsProduct(text, tokens, matchOpts);
     });
 
+    // Discussion pages about the product class + distinctive keywords (reddit, wirecutter, CR, forums)
+    const discussionHosts =
+      /(reddit\.com|wirecutter|consumerreports|consumer\s*reports|trustpilot|sitejabber|forum|community|stackoverflow|stackexchange|quora\.com|facebook\.com\/groups)/i;
+    const classDiscussion = deduped.filter((hit) => {
+      if (isSpamUrl(hit.url)) return false;
+      if (!discussionHosts.test(hit.url) && !discussionHosts.test(hit.title || "")) return false;
+      const text = `${hit.title} ${hit.snippet}`;
+      return mentionsProduct(text, tokens, matchOpts) || mentionsProduct(text, distinctive, { asin });
+    });
+
+    if (relevant.length === 0 && classDiscussion.length >= 2) {
+      // Thin but real independent discussion — produce Wait/Buy/Skip from evidence, not empty
+      const merged = dedupeResults([...classDiscussion, ...relevant]);
+      let gotchas = buildGotchas(merged);
+      const honestyExtras = buildHonestyGotchas(merged, {
+        price,
+        title: cleanTitle,
+        tokens,
+      });
+      for (const g of honestyExtras) {
+        if (!gotchas.some((x) => x.type === g.type || x.title === g.title)) gotchas.push(g);
+      }
+      if (gotchas.length === 0) {
+        const sample = merged.slice(0, 2);
+        gotchas.push({
+          title: "Open-web discussion found (thin product-page data)",
+          detail: amazonBlocked
+            ? `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}” and found discussion pages. Snippets are limited; open the sources.`
+            : `Found discussion pages about this product/class for “${cleanTitle}”, but evidence is still thin. Open the sources before buying.`,
+          sourceUrls: sample.map((s) => s.url),
+        });
+      } else if (amazonBlocked) {
+        gotchas.unshift({
+          title: "Amazon review text unavailable",
+          detail: `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}”.`,
+          sourceUrls: url ? [url] : [],
+        });
+      }
+      gotchas = gotchas.slice(0, 5);
+      const sources = buildSources(merged, url || null);
+      const honesty = buildHonestyFlags(merged, gotchas, true);
+      honesty.thinEvidence = merged.length < 3;
+      const { verdict, summary } = decideVerdict(merged, gotchas, honesty);
+      const summaryOut = amazonBlocked
+        ? `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}”. ${summary}`
+        : summary;
+      return attachVerdictLabels({
+        verdict,
+        summary: summaryOut,
+        gotchas,
+        sources,
+        researched: true,
+        honesty,
+        disclaimer:
+          "Research used free public search snippets. Amazon often blocks bots, so open-web discussion was used when the listing title was recovered from the URL. No reviews or URLs were invented.",
+        _debug: {
+          queryCount: queries.length,
+          rawHits: deduped.length,
+          relevantHits: merged.length,
+          brandBit: brandBit || null,
+          asin: asin || null,
+        },
+      });
+    }
+
     if (relevant.length === 0) {
-      const fallbackGotchas = [
-        {
+      const fallbackGotchas = [];
+      if (amazonBlocked || (asin && url && /amazon\./i.test(url))) {
+        fallbackGotchas.push({
+          title: "Amazon review text unavailable",
+          detail: `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}” (including ASIN ${asin || "n/a"} and complaint terms). Little product-specific discussion stuck after filtering.`,
+          sourceUrls: url ? [url] : [],
+        });
+      } else {
+        fallbackGotchas.push({
           title: "Almost nothing usable found",
           detail: `Searched public web results for “${cleanTitle}” (including scam / fake-review queries) but could not keep pages that clearly mention this product. DuckDuckGo/Reddit may block bots; Bing/CPSC were also queried when reachable.`,
           sourceUrls: [],
-        },
-      ];
+        });
+      }
       if (price) {
         fallbackGotchas.push({
           title: `Listed price signal: ${price}`,
@@ -865,10 +1099,12 @@ async function researchProduct({ title, url, price, siteName } = {}) {
         recallMentions: false,
         thinEvidence: true,
       };
+      const summary = amazonBlocked || (asin && url && /amazon\./i.test(url))
+        ? `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}”. Research found little usable independent discussion. Wait — we are not inventing gotchas.`
+        : "Research found almost nothing usable for this exact product. Wait — we are not inventing gotchas.";
       return attachVerdictLabels({
         verdict: "Wait",
-        summary:
-          "Research found almost nothing usable for this exact product. Wait — we are not inventing gotchas.",
+        summary,
         gotchas: fallbackGotchas.slice(0, 5),
         sources: url
           ? [
@@ -921,10 +1157,18 @@ async function researchProduct({ title, url, price, siteName } = {}) {
       if (sample.length) {
         gotchas.push({
           title: "No strong red-flag cluster in snippets",
-          detail: `Independent hits turned up (e.g. “${(sample[0].title || "").slice(0, 80)}”) without clear recall/scam/failure language in the snippets we parsed. That is not a guarantee — only what this pass saw.`,
+          detail: `Independent hits turned up (e.g. “${(sample[0].title || "").slice(0, 80)}”) without a clear cluster of hard-avoid language in the snippets we parsed. That is not a guarantee — only what this pass saw.`,
           sourceUrls: sample.map((s) => s.url),
         });
       }
+    }
+
+    if (amazonBlocked) {
+      gotchas.unshift({
+        title: "Amazon review text unavailable",
+        detail: `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}” and included whatever independent sources turned up.`,
+        sourceUrls: url ? [url] : [],
+      });
     }
 
     gotchas = gotchas.slice(0, 5);
@@ -935,10 +1179,13 @@ async function researchProduct({ title, url, price, siteName } = {}) {
       honesty.thinEvidence = false;
     }
     const { verdict, summary } = decideVerdict(relevant, gotchas, honesty);
+    const summaryOut = amazonBlocked
+      ? `Couldn't pull Amazon review text (Amazon blocks bots) — searched the open web for “${cleanTitle}”. ${summary}`
+      : summary;
 
     return attachVerdictLabels({
       verdict,
-      summary,
+      summary: summaryOut,
       gotchas,
       sources,
       researched: true,
@@ -950,6 +1197,8 @@ async function researchProduct({ title, url, price, siteName } = {}) {
         rawHits: deduped.length,
         relevantHits: relevant.length,
         brandBit: brandBit || null,
+        asin: asin || null,
+        distinctive,
       },
     });
   }

@@ -101,9 +101,187 @@ function extractPrice(text) {
   return m ? m[0].replace(/\s+/g, " ").trim() : null;
 }
 
+const JUNK_SITE_TITLES = new Set([
+  "amazon",
+  "amazon.com",
+  "amazon.co.uk",
+  "amazon.ca",
+  "amazon.de",
+  "walmart",
+  "walmart.com",
+  "ebay",
+  "ebay.com",
+  "target",
+  "target.com",
+  "best buy",
+  "bestbuy",
+  "bestbuy.com",
+  "etsy",
+  "etsy.com",
+  "aliexpress",
+  "temu",
+  "shopify",
+]);
+
+function normalizeTitleCandidate(raw) {
+  if (!raw) return null;
+  let t = String(raw).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  // Strip Amazon.com: prefix (common when bots get a soft interstitial)
+  t = t.replace(/^Amazon\.com\s*[:\-–—]\s*/i, "");
+  t = t.replace(/^Amazon\.[a-z.]{2,6}\s*[:\-–—]\s*/i, "");
+  // Strip trailing marketplace / breadcrumb tails
+  t = t
+    .replace(/\s*[:|–—-]\s*Amazon\.com.*$/i, "")
+    .replace(/\s*[:|–—-]\s*Amazon\.ca.*$/i, "")
+    .replace(/\s*[:|–—-]\s*Amazon\.co\.uk.*$/i, "")
+    .replace(/\s*[:|–—-]\s*Walmart\.com.*$/i, "")
+    .replace(/\s*[:|–—-]\s*Home\s*&\s*Kitchen\s*$/i, "")
+    .replace(/\s*[:|–—-]\s*Sports\s*&\s*Outdoors\s*$/i, "")
+    .replace(/\s*[:|–—-]\s*Electronics\s*$/i, "")
+    .replace(/\s+at\s+Amazon\.com.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return t || null;
+}
+
+/** Shorter research query from a long Amazon SEO title */
+function compactSearchTitle(title, slugTitle) {
+  const cleaned = normalizeTitleCandidate(title) || title || "";
+  if (slugTitle && slugTitle.length >= 12) {
+    // Prefer slug words when they overlap the cleaned title (more searchable)
+    const slugL = slugTitle.toLowerCase();
+    const cleanL = cleaned.toLowerCase();
+    const slugWords = slugTitle.split(/\s+/).filter((w) => w.length >= 4);
+    const overlap = slugWords.filter((w) => cleanL.includes(w.toLowerCase())).length;
+    if (overlap >= 2 || /quencher|tumbler|stanley|powercore|anker/i.test(slugL + cleanL)) {
+      // Blend: if cleaned has a known brand word missing from slug, prepend it
+      let out = slugTitle;
+      if (/\bstanley\b/i.test(cleaned) && !/\bstanley\b/i.test(out)) {
+        out = "Stanley " + out;
+      }
+      if (/\banker\b/i.test(cleaned) && !/\banker\b/i.test(out)) {
+        out = "Anker " + out;
+      }
+      return out.replace(/\s+/g, " ").trim();
+    }
+  }
+  // Truncate huge SEO titles at first pipe / reasonable length
+  let t = cleaned.split("|")[0].split(":")[0].trim();
+  if (t.length > 90) t = t.slice(0, 90).replace(/\s+\S*$/, "").trim();
+  return t || cleaned || slugTitle || null;
+}
+
+function isJunkProductTitle(title) {
+  if (!title) return true;
+  const t = String(title).replace(/\s+/g, " ").trim();
+  if (t.length < 8) return true;
+  const lower = t.toLowerCase();
+  if (JUNK_SITE_TITLES.has(lower)) return true;
+  // Brand-only / site-name-only patterns
+  if (/^amazon(\.com)?$/i.test(t)) return true;
+  if (/^(shop|store|home|official\s+store)$/i.test(t)) return true;
+  // Very short single-token site names
+  if (!/\s/.test(t) && t.length < 12 && /amazon|walmart|ebay|target|etsy/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function parseAmazonAsinAndSlug(urlString) {
+  try {
+    const u = new URL(urlString);
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    if (!/(^|\.)amazon\./i.test(host)) return { asin: null, slugTitle: null };
+    const path = u.pathname || "";
+    let asin = null;
+    let slug = null;
+    // /Slug-Words/dp/ASIN or /dp/ASIN or /gp/product/ASIN
+    let m = path.match(/\/([^/]+)\/dp\/([A-Z0-9]{10})(?:[/?]|$)/i);
+    if (m) {
+      slug = m[1];
+      asin = m[2].toUpperCase();
+    } else {
+      m = path.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:[/?]|$)/i);
+      if (m) asin = m[1].toUpperCase();
+    }
+    // Also check query asin=
+    if (!asin) {
+      const q = u.searchParams.get("asin") || u.searchParams.get("ASIN");
+      if (q && /^[A-Z0-9]{10}$/i.test(q)) asin = q.toUpperCase();
+    }
+    // /clp/ASIN style redirects — no slug
+    if (!asin) {
+      m = path.match(/\/(?:clp|product)\/([A-Z0-9]{10})(?:[/?]|$)/i);
+      if (m) asin = m[1].toUpperCase();
+    }
+    let slugTitle = null;
+    if (slug && !/^(dp|gp|product|clp)$/i.test(slug)) {
+      // Drop trailing ref-like noise; keep readable words
+      const words = slug
+        .replace(/_/g, "-")
+        .split("-")
+        .map((w) => w.trim())
+        .filter((w) => w && !/^(ref|dp|gp)$/i.test(w) && !/^[A-Z0-9]{10}$/i.test(w));
+      if (words.length >= 2) {
+        slugTitle = words.join(" ");
+      }
+    }
+    return { asin, slugTitle };
+  } catch {
+    return { asin: null, slugTitle: null };
+  }
+}
+
+function extractJsonLdProductName($) {
+  const names = [];
+  $('script[type="application/ld+json"]').each((_, el) => {
+    const raw = $(el).contents().text() || $(el).html() || "";
+    if (!raw.trim()) return;
+    try {
+      const data = JSON.parse(raw);
+      const stack = Array.isArray(data) ? [...data] : [data];
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node || typeof node !== "object") continue;
+        const type = node["@type"];
+        const types = Array.isArray(type) ? type : type ? [type] : [];
+        const isProduct = types.some((t) => /product/i.test(String(t)));
+        if (isProduct && node.name) {
+          const n = Array.isArray(node.name) ? node.name[0] : node.name;
+          if (typeof n === "string" && n.trim()) names.push(n.trim());
+        }
+        if (node["@graph"]) {
+          const g = Array.isArray(node["@graph"]) ? node["@graph"] : [node["@graph"]];
+          stack.push(...g);
+        }
+      }
+    } catch {
+      /* ignore bad JSON-LD */
+    }
+  });
+  return names[0] || null;
+}
+
+function pickBestTitle(candidates) {
+  const scored = [];
+  for (const c of candidates) {
+    const t = normalizeTitleCandidate(c);
+    if (!t) continue;
+    if (isJunkProductTitle(t)) continue;
+    // Prefer longer, multi-word titles
+    const words = t.split(/\s+/).length;
+    const score = t.length + words * 8;
+    scored.push({ t, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.t || null;
+}
+
 async function fetchMetadata(targetUrl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
+  const { asin: urlAsin, slugTitle: urlSlugTitle } = parseAmazonAsinAndSlug(targetUrl);
   try {
     const res = await fetch(targetUrl, {
       signal: controller.signal,
@@ -114,19 +292,58 @@ async function fetchMetadata(targetUrl) {
         Accept: "text/html,application/xhtml+xml",
       },
     });
+    const finalUrl = res.url || targetUrl;
+    // Re-parse ASIN/slug from final URL (Amazon may redirect /dp/... → /clp/...)
+    const fromFinal = parseAmazonAsinAndSlug(finalUrl);
+    // Prefer original-path slug when redirect drops it (e.g. → /clp/ASIN)
+    const asin = fromFinal.asin || urlAsin || null;
+    const slugTitle = urlSlugTitle || fromFinal.slugTitle || null;
+
     if (!res.ok) {
+      const fallbackTitle = pickBestTitle([slugTitle]) || slugTitle || null;
       return {
         ok: false,
         error: `Page returned HTTP ${res.status}`,
         status: res.status,
+        title: fallbackTitle,
+        asin,
+        searchTitle: fallbackTitle,
+        slugTitle,
+        finalUrl,
       };
     }
     const html = await res.text();
     const $ = cheerio.load(html);
-    const title =
-      pickMeta($, "og:title", "twitter:title") ||
-      $("title").first().text().trim() ||
+
+    const ogTitle = pickMeta($, "og:title", "twitter:title");
+    const docTitle = $("title").first().text().trim() || null;
+    const metaNameTitle = $('meta[name="title"]').attr("content") || null;
+    const productTitleEl =
+      $("#productTitle").first().text().trim() ||
+      $("#title").first().text().trim() ||
+      $('[data-feature-name="title"] #productTitle').first().text().trim() ||
       null;
+    const jsonLdName = extractJsonLdProductName($);
+
+    const rawBest =
+      pickBestTitle([productTitleEl, jsonLdName, metaNameTitle, ogTitle, docTitle, slugTitle]) ||
+      (slugTitle && !isJunkProductTitle(slugTitle) ? slugTitle : null) ||
+      normalizeTitleCandidate(ogTitle) ||
+      normalizeTitleCandidate(docTitle) ||
+      slugTitle ||
+      null;
+    // Prefer a human title: cleaned meta if good, else slug-compacted
+    let bestTitle = normalizeTitleCandidate(rawBest) || rawBest;
+    if (bestTitle && bestTitle.length > 120 && slugTitle) {
+      bestTitle = compactSearchTitle(bestTitle, slugTitle) || bestTitle;
+    }
+
+    // searchTitle: prefer compact slug/product wording for research queries
+    const pickedForSearch =
+      pickBestTitle([productTitleEl, jsonLdName, slugTitle, metaNameTitle, ogTitle, docTitle]) ||
+      bestTitle;
+    const searchTitle = compactSearchTitle(pickedForSearch || bestTitle, slugTitle);
+
     const image =
       pickMeta($, "og:image", "twitter:image") ||
       $('link[rel="image_src"]').attr("href") ||
@@ -151,19 +368,36 @@ async function fetchMetadata(targetUrl) {
     const siteName = pickMeta($, "og:site_name");
     return {
       ok: true,
-      title: title || null,
+      title: bestTitle || null,
       image: image || null,
       price: price || null,
       description: desc || null,
       siteName: siteName || null,
-      finalUrl: res.url || targetUrl,
+      finalUrl,
+      asin,
+      searchTitle: searchTitle || bestTitle || null,
+      slugTitle,
+      amazonBlocked:
+        Boolean(asin) &&
+        (isJunkProductTitle(normalizeTitleCandidate(ogTitle) || ogTitle) ||
+          isJunkProductTitle(normalizeTitleCandidate(docTitle) || docTitle)) &&
+        Boolean(slugTitle),
     };
   } catch (err) {
     const msg =
       err.name === "AbortError"
         ? "Timed out reading the page"
         : err.message || "Could not reach the page";
-    return { ok: false, error: msg };
+    const fallbackTitle = pickBestTitle([urlSlugTitle]) || urlSlugTitle || null;
+    return {
+      ok: false,
+      error: msg,
+      title: fallbackTitle,
+      asin: urlAsin || null,
+      searchTitle: fallbackTitle,
+      slugTitle: urlSlugTitle || null,
+      finalUrl: targetUrl,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -228,26 +462,82 @@ app.post("/api/check", async (req, res) => {
 
   if (parsed) {
     const fetched = await fetchMetadata(parsed.toString());
+    // Always carry ASIN / slug-derived title even when fetch "ok" but title was junk
+    const amazonBits = parseAmazonAsinAndSlug(parsed.toString());
     if (fetched.ok) {
+      const chosenTitle =
+        (fetched.title && !isJunkProductTitle(fetched.title) ? fetched.title : null) ||
+        (manualTitle && !isJunkProductTitle(manualTitle) ? manualTitle : null) ||
+        fetched.searchTitle ||
+        fetched.slugTitle ||
+        fetched.title ||
+        manualTitle ||
+        null;
       meta = {
         ok: true,
-        title: fetched.title || manualTitle || null,
+        title: chosenTitle,
         price: fetched.price,
         image: fetched.image,
         description: fetched.description,
         siteName: fetched.siteName,
         finalUrl: fetched.finalUrl,
         error: null,
+        asin: fetched.asin || amazonBits.asin || null,
+        searchTitle:
+          fetched.searchTitle ||
+          chosenTitle ||
+          fetched.slugTitle ||
+          amazonBits.slugTitle ||
+          null,
+        slugTitle: fetched.slugTitle || amazonBits.slugTitle || null,
+        amazonBlocked: Boolean(fetched.amazonBlocked),
       };
     } else {
       meta.error = fetched.error;
-      meta.title = manualTitle || null;
-      meta.finalUrl = rawUrl;
+      meta.title =
+        (manualTitle && !isJunkProductTitle(manualTitle) ? manualTitle : null) ||
+        fetched.title ||
+        fetched.slugTitle ||
+        amazonBits.slugTitle ||
+        manualTitle ||
+        null;
+      meta.finalUrl = fetched.finalUrl || rawUrl;
+      meta.asin = fetched.asin || amazonBits.asin || null;
+      meta.searchTitle =
+        fetched.searchTitle ||
+        meta.title ||
+        fetched.slugTitle ||
+        amazonBits.slugTitle ||
+        null;
+      meta.slugTitle = fetched.slugTitle || amazonBits.slugTitle || null;
+      meta.amazonBlocked = Boolean(meta.asin);
+    }
+  } else if (rawUrl) {
+    const amazonBits = parseAmazonAsinAndSlug(rawUrl);
+    if (amazonBits.asin || amazonBits.slugTitle) {
+      meta.asin = amazonBits.asin;
+      meta.slugTitle = amazonBits.slugTitle;
+      if (!meta.title || isJunkProductTitle(meta.title)) {
+        meta.title = manualTitle || amazonBits.slugTitle || meta.title;
+      }
+      meta.searchTitle = meta.title || amazonBits.slugTitle;
     }
   }
 
   const title = meta.title || manualTitle || null;
-  if (!title) {
+  if (!title || isJunkProductTitle(title)) {
+    // Last chance: Amazon slug from URL even if meta failed entirely
+    if (parsed) {
+      const bits = parseAmazonAsinAndSlug(parsed.toString());
+      if (bits.slugTitle) {
+        meta.title = bits.slugTitle;
+        meta.searchTitle = bits.slugTitle;
+        meta.asin = meta.asin || bits.asin;
+      }
+    }
+  }
+  const resolvedTitle = meta.title || manualTitle || null;
+  if (!resolvedTitle) {
     return res.status(400).json({
       ok: false,
       error: meta.error
@@ -258,11 +548,19 @@ app.post("/api/check", async (req, res) => {
 
   let analysis;
   try {
+    const researchQuery =
+      compactSearchTitle(meta.searchTitle || resolvedTitle, meta.slugTitle) ||
+      meta.searchTitle ||
+      resolvedTitle;
     analysis = await researchProduct({
-      title,
+      title: compactSearchTitle(resolvedTitle, meta.slugTitle) || resolvedTitle,
+      searchTitle: researchQuery,
       url: meta.finalUrl || rawUrl || null,
       price: meta.price,
       siteName: meta.siteName || null,
+      asin: meta.asin || null,
+      slugTitle: meta.slugTitle || null,
+      amazonBlocked: Boolean(meta.amazonBlocked),
     });
   } catch (err) {
     analysis = attachVerdictLabels({
@@ -306,16 +604,19 @@ app.post("/api/check", async (req, res) => {
     id: `check-${Date.now()}`,
     isExample: false,
     url: meta.finalUrl || rawUrl || null,
-    title: title || "Untitled product",
+    title: (compactSearchTitle(resolvedTitle, meta.slugTitle) || resolvedTitle) || "Untitled product",
     price: meta.price,
     image: meta.image,
     fetchFailed: Boolean(parsed) && !meta.ok,
     fetchError: meta.error,
+    asin: meta.asin || null,
     ...analysis,
     fetched: {
       title: meta.title,
       price: meta.price,
       image: meta.image,
+      asin: meta.asin || null,
+      searchTitle: meta.searchTitle || null,
     },
   };
 
